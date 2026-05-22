@@ -15,6 +15,7 @@ uint8_t output_buffer[128];
 uint8_t remaining_bytes_in_current_payload;
 uint8_t is_payload_count_left;
 uint8_t current_input_buffer_index;
+uint8_t last_correctly_recieved_counter;
 
 int main(void){
 
@@ -22,6 +23,7 @@ int main(void){
     remaining_bytes_in_current_payload = 0;
     is_payload_count_left = 0;
     current_input_buffer_index = 0;
+    last_correctly_recieved_counter = 0;
 
     // Initialising the streams
     input_stream = fopen("input.txt", "w");
@@ -62,6 +64,7 @@ void output(){
 }
 
 void act_on_input(){
+    /*
     printf("I have a packet: ");
     printf("%d %d ", input_buffer[0], input_buffer[1]);
     uint8_t i = 0;
@@ -70,6 +73,22 @@ void act_on_input(){
         printf("%d ", input_buffer[i+2]);
     }
     printf("%d %d\n\n", input_buffer[i+2], input_buffer[i+3]);    
+    */
+
+    uint8_t counter = ((input_buffer[1])&(0b111));
+    uint8_t payload_count = ((input_buffer[1])>>3);
+    uint8_t type = input_buffer[payload_count+2];
+    uint8_t checksum = input_buffer[payload_count+3];
+    
+    checksum+=type;
+    checksum+= 0xDB;
+    checksum+= input_buffer[1];
+    uint8_t i = 0;
+    for (; i < (input_buffer[1]>>3); i++) {
+        checksum+= input_buffer[i+2];
+    }
+    if (checksum!=0) printf("error packet\n\n");
+    else printf("nice packet\n\n");
 }
 
 void read_input(uint8_t number_of_bytes){
