@@ -11,7 +11,17 @@ void package_sensor(uint8_t);
 uint8_t input_buffer[32];
 uint8_t output_buffer[128];
 
+// some state variables
+uint8_t remaining_bytes_in_current_payload;
+uint8_t is_payload_count_left;
+uint8_t current_input_buffer_index;
+
 int main(void){
+
+    // Initial State
+    remaining_bytes_in_current_payload = 0;
+    is_payload_count_left = 0;
+    current_input_buffer_index = 0;
 
     // Initialising the streams
     input_stream = fopen("input.txt", "w");
@@ -51,25 +61,53 @@ void output(){
     fclose(output_stream);
 }
 
+void act_on_input(){
+    printf("I have a packet: ");
+    printf("%d %d ", input_buffer[0], input_buffer[1]);
+    uint8_t i = 0;
+    for (; i < (input_buffer[1]>>3); i++)
+    {
+        printf("%d ", input_buffer[i+2]);
+    }
+    printf("%d %d\n\n", input_buffer[i+2], input_buffer[i+3]);    
+}
+
 void read_input(uint8_t number_of_bytes){
     input_stream = fopen("input.txt", "r");
     
     uint8_t byte = 0;
 
+    if (is_payload_count_left) {
+        fscanf(input_stream, " %hhu", &byte);
+        input_buffer[0] = 0xDB;
+        input_buffer[1] = byte;
+        remaining_bytes_in_current_payload = ((byte>>3)+2);
+        is_payload_count_left = 0;
+        number_of_bytes--;
+    }
+
     for (uint8_t i = 0; i < number_of_bytes; i++){
         fscanf(input_stream, " %hhu", &byte);
 
-        if (byte == 0xDB) {
-            if (i == number_of_bytes-1) printf("I found a start but payload size comes afterwards\n");
+        if (remaining_bytes_in_current_payload > 0){
+            input_buffer[current_input_buffer_index++] = byte;
+            remaining_bytes_in_current_payload--;
+            if (remaining_bytes_in_current_payload == 0){
+                act_on_input();
+            }
+        } else if (byte == 0xDB) {
+            current_input_buffer_index = 2;
+            if (i == number_of_bytes-1) {
+                is_payload_count_left = 1;
+            }
             else {
                 fscanf(input_stream, " %hhu", &byte);
                 i++;
-                printf("I found a start and expect a %d byte payload\n", byte);
+                input_buffer[0] = 0xDB;
+                input_buffer[1] = byte;
+                remaining_bytes_in_current_payload = ((byte>>3)+2);
             }
         }
-
-        printf("I found byte %hhu\n", byte);
-        input_buffer[i] = byte;
     }
 
     fclose(input_stream);
