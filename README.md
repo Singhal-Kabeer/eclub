@@ -1,23 +1,159 @@
-# Firmware Task
+# Firmware Communication Layer
+---
 
-## COMPILATION & EXECUTION
-This project relies strictly on standard C libraries. 
-Compile: `clang device.c`
-Execute: `./a.out`
+## Table of Contents
+- [Overview](#overview)
+- [The Problem](#the-problem)
+- [Protocol Design](#protocol-design)
+- [Implementation](#implementation)
+- [Building and Running](#building-and-running)
+- [Interface Reference](#interface-reference)
+- [Testing and Simulation](#testing-and-simulation)
+- [Demos](#demos)
+- [Known Limitations](#known-limitations)
 
-## THE TASK
-My task was to build a communication layer for communication between two devices which send sensor data to each other through a non-ideal channel. The channel can
-- corrupt some bytes
-- drop packets in the middle
-- duplicate packets
-- delay transmissions
-- insert garbage bytes
-- split packets across multiple updates
-- merge multiple packets together
+---
 
-## THE IMPLEMENTATION
-### Tester Role
-My implementation is a c code. The code compiles to a terminal based application. The terminal provides an interface to test the communication layer. The tester (one who executes the executable) will act as
+## Overview
+
+The task was to build a communication layer for sensor data exchange between two devices over a non-ideal channel with strict memory constraints. My implementation is a c program that compiles to a terminal based application. The maximum packet size is 32 bytes and the total memory consumed is less than 256 bytes.
+
+---
+
+## The Problem
+
+Two embedded devices continuously exchange sensor data. The channel between them is non-ideal and can:
+
+- Corrupt individual bytes
+- Drop packets entirely
+- Duplicate packets
+- Delay transmissions
+- Insert arbitrary garbage bytes
+- Split packets across multiple transmission windows
+- Merge multiple packets into a single transmission window
+
+The implementation recovers gracefully from all of the above without exceeding 256 bytes of RAM.
+
+---
+
+## Protocol Design
+
+### Packet Structure
+
+| Byte Index | Field | Description |
+| :--- | :--- | :--- |
+| 0 | `start` | Fixed start byte `0xDB` (219, chosen at random). Marks the beginning of every packet. |
+| 1 | `metadata` | Upper 5 bits: payload size in bytes (max 28). Lower 3 bits: 0 to 7 to 0 counter to identify packet. |
+| 2 to N | `payload` | The actual data bytes. |
+| N+1 | `type` | `0` = sensor data, `1` = acknowledgement, `2` = re-ask. |
+| N+2 | `checksum` | All bytes in a correct packet must sum to a multiple of 256. |
+
+**Example:** A valid packet carrying 3 bytes of payload with counter 0 is
+
+```
+219 24 24 19 50 0 176
+```
+
+The metadata byte `24` is `00011 000` in binary. The upper 5 bits `00011` (3, in base 10) is the number of bytes in payload and the lower 3 bits `000` (0, in base 10) is the identification counter of the packet.
+
+### Counter
+
+The lower 3 bits of the metadata byte form a rolling counter. They increase from 0 to 1 to 2 and so on until 7 and then wrap around to 0 and then 1 and so on. Counters are used only for sensor data packets. Reply packets always carry counter 0.
+
+Counters serve two purposes:
+- **Identity**: each packet has a known sequence number.
+- **Gap detection**: receiving counter 5 when the last correctly received counter was 3 means counter 4 was dropped.
+
+NOTE : Reply packets do not have (valid) counters. The reasons, which will be clearer after reading the rest of the implementation, are
+1. Replies are not generated for replies, since this accumulates network traffic
+2. Replies are also not stored and transmitted together with the sensor data packets. Reason is that during retransmission of lost packets, if the sensor transmission and replies are interleaved then same replies will be sent twice. This is catastrophic. Since replies and sensor-packets are not stored together, they cannot be transmitted in the correct counter sequence even if replies are assigned counters.
+
+### Packet Types
+
+**Sensor data (type 0):** payload is raw sensor bytes. On receipt, the receiver generates an acknowledgement.
+
+**Acknowledgement (type 1):** one byte payload carrying the counter of the last correctly received packet. The sender uses this to free its output buffer.
+
+**Re-ask (type 2):** one byte payload carrying the counter of the packet that needs to be resent. The sender resends that packet and all subsequent ones. Receiving a re-ask for counter N also implicitly acknowledges all packets before counter N.
+
+### Error States
+
+The receiver operates in one of three states:
+
+| State | Meaning |
+| :--- | :--- |
+| `NORMAL` | Operating correctly. |
+| `IN_ERROR` | Corruption or gap detected. Re-ask generated but not yet sent. Receiver goes deaf to all sensor-data packets that come in this state, while still acting on acknowledgements and reasks. This decision to not going deaf to replies reduces network traffic and allows faster communication. Other option, to go deaf to all incoming packets would allow for interleaved reply and output buffers but increases network traffic |
+| `IN_RECOVERY` | Re-ask has been sent. Ignoring all further sensor packets until the expected counter arrives. |
+
+Once the expected counter is correctly received, the receiver returns to `NORMAL`.
+
+---
+
+## Implementation
+
+### Memory Architecture
+
+The 256-byte RAM budget is allocated as follows:
+
+| Buffer | Size |
+| :--- | :--- |
+| Output buffer (circular) | 128 bytes |
+| Reply buffer | 20 bytes |
+| Input buffer | 32 bytes |
+
+The memory left is left to make room for state variables and the stack variables.
+
+### Output Buffer
+
+The output buffer is a circular buffer of 128 bytes with three pointers:
+
+- `start_of_unacknowledged_output` — oldest packet not yet acknowledged. Nothing after this is ever overwritten.
+- `start_of_unsent_output` — next byte to transmit. On re-ask, this rewinds to `start_of_unacknowledged_output` and sweeps forward to the requested counter.
+- `end_of_output` — where the next packet will be written. Never allowed to reach `start_of_unacknowledged_output` (one slot kept empty to distinguish full from empty buffer).
+
+New sensor packets are written at `end_of_output`. When output is flushed, `start_of_unsent_output` advances. On acknowledgement, `start_of_unacknowledged_output` advances, freeing space. On reask, `start_of_unsent_output` goes back.
+
+### Input Processing
+
+`read_input()` processes `n` bytes from `input.txt` in a single pass. It scans for the start byte `0xDB`, then accumulates subsequent bytes into the input buffer until the packet is complete, then calls `act_on_input()`. It then continues scanning for the next packet.
+
+Packets split across multiple `r n` calls are handled via two state variables: `remaining_bytes_in_current_payload` tracks how many bytes of the current packet are still expected, and `is_payload_count_left` handles the edge case where the start byte and metadata byte arrive in separate calls.
+
+### Key Functions
+
+**`package_sensor(n)`** — reads `n` bytes from `sensor.txt` and writes one or more packets into the output buffer. Packets are at most 28 bytes of payload each. Checks available space before writing.
+
+**`output()`** — flushes the output buffer and reply buffer to `output.txt`. Advances `start_of_unsent_output`. Transitions error state from `IN_ERROR` to `IN_RECOVERY`.
+
+**`read_input(n)`** — reads `n` bytes from `input.txt` and processes any complete packets found.
+
+**`act_on_input()`** — dispatches on packet type. Verifies checksum, checks counter sequence, generates replies or re-asks, and advances output buffer pointers on acknowledgement or re-ask.
+
+**`make_reply(type, payload)`** — writes a reply packet into the reply buffer. Silently fails if the buffer already holds 4 replies or if the receiver is not in `NORMAL` state.
+
+**`get_counter_in_output_buffer(pos)`** — given the position of the start byte of a packet in the output buffer, returns its counter value.
+
+**`nxt(pos)`** — given the position of the start byte of a packet in the output buffer, returns the position of the start byte of the next packet.
+
+---
+
+## Building and Running
+
+```bash
+clang device.c
+./a.out
+```
+
+To simulate two devices, create two folders, copy the executable into each, and run one in each folder.
+
+**Note:** The application creates blank `input.txt`, `output.txt`, and `sensor.txt` on launch, overwriting any existing files. Tester should not write to these files before launching.
+
+---
+
+## Interface Reference
+
+The terminal provides an interface to test the communication layer. The tester (one who executes the executable) will act as
 
 - the second device, when processing the output by the application to generate adequate input
 - the channel, when providing input data to the application and reading the output data from it
@@ -26,62 +162,36 @@ My implementation is a c code. The code compiles to a terminal based application
 
 Simulations can be run by using two executables each in a separate folder. Python can generate random sensor data for a device and manual copy paste operations (while corrupting the data after copy before paste) can simulate a non-ideal channel.
 
+| Command | Description |
+| :--- | :--- |
+| `m <n>` | Read `n` bytes from `sensor.txt` and package them into the output buffer. |
+| `o` | Flush output buffer and reply buffer to `output.txt`. Overwrites previous contents. |
+| `r <n>` | Read `n` bytes from `input.txt` and process any complete packets found. |
+| `t` | Trigger a timeout. Rewinds `start_of_unsent_output` to `start_of_unacknowledged_output`, scheduling all unacknowledged packets for retransmission on the next `o`. |
+| `e` | Exit the application. |
 
-### Interface
-As soon as the the application is launched, it creats three blank text files in the same folder. Further an infinite loop is initiated that repeatedly prompts for input. Inputting `e` ends the application.
-- `sensor.txt` this file stream is filled by tester. Application reads the data, packages it and schedules it to be sent on command of the tester. The tester writes data into this file. Then in the prompt of the application writes `m` followed by a space and the number of bytes the testers wants to packet. NOTE: APPLICATION EXPECTS THE FILES TO BE OVERWRITTEN WITH NEW DATA WHENEVER A READ OPERATION IS REQUIRED (SO IT READS FROM THE BEGINNING ONLY, NOT FROM PREVIOUS OFFSET) THUS BEFORE EACH CALL THE TESTER IS EXPECTED TO OVERWRITE (AND NOT APPEND TO) SENSOR AND INPUT FILES
-- `output.txt` this file stream is filled by the application on command of tester. NOTE: THIS FILE IS OVERWRITTEN (AND NOT APPENDED TO) ON EVERY CALL. TESTER MUST STORE OUTPUT ELSEWHERE IF PREVIOUS OUTPUT IS NEEDED. The command used by tester is a simple `o`. Thereafter the application will overwrite the `output.txt` with all the output it has scheduled (replies as well as new sensor packets).
-- `input.txt` this file stream is filled by tester. ideally this is the data coming from the other device's output stream. The command used by tester is `r` followed by a space and a number. The number represents the number of bytes the tester wants the application to read.
+**Important notes on file handling:**
+- `sensor.txt` and `input.txt` are always read from the beginning. Overwrite them (do not append) before each `m` or `r` call.
+- `output.txt` is overwritten on every `o` call. Save its contents elsewhere before calling `o` again if you need the previous output.
+### Timeout
 
-NOTE: AS SOON AS THE APP LAUNCHES, IT OVERWRITES ALL FILES (MAKES THEM BLANK). SO DO NOT STORE DATA INTO SENSOR OUT INPUT BEFORE STARTING THE APPLICATION.
+If an acknowledgement is dropped or tampered with, the sender's output buffer freezes — it holds unacknowledged packets it can never free, and the receiver has no mechanism to re-ask for reply packets. In a real system this would be resolved by a hardware timer. In this simulation, the tester issues a `t` command followed by `o` to force retransmission of all unacknowledged packets.
 
-All files are text files. Bytes are written to and read from these as simple decimal integers (`uint8_t`)
+---
 
-The sendor has access to another command. The timeout command `t`. The purpose of this command is written in the communication layer header.
+## Testing and Simulation
 
-## THE COMMUNICATION LAYER
-### Packet Structure
-| Index | Field | Description |
-| :--- | :--- | :--- |
-| 0 | `start` | I chose a random byte : 0xDB (in decimal, 219). Indicates start of a packet |
-| 1 | `meta-data` | First five bits represent the number of bytes of payload the packet is carrying (maximum 28). The last three bits represent a counter in packets. This counter counts from 0 to 7 then rolls back to 0. This is used as an identity of the packets and for identifying missing packets (recieving a packet with counter 5 when the last recieved counter is 3 indicates that the packet 4 was dropped). |
-| 2 to N | `payload` | The actual data |
-| N+1 | `type` | Represents the type of the byte. `0` means that this packet's payload is sensor data, `1` means this packet's payload is the counter of the packet we sent which was succefully recieved, `2` means this packet's payload is the counter the packet corresponding to which needs to be resent (along with all packets after that one). |
-| N+2 | `checksum` | The total of all bytes in the packet must sum up to a multiple of 256. |
+### Simulation Setup
 
-So a sample packet carrying 3 bytes of sensor data (`24 19 50`) would be `219 24 24 19 50 0 176`. This is because `24` in base two is `00011 000` where the first five bits `00011` represents a payload of 3 bytes and the last three bits `000` represent the counter of this packet (here taken to be zero).
+1. Two executables are placed in separate folders (`/device1/`, `/device2/`).
+2. Each is launched to initialise its file streams.
+3. A Python script generates random integers in the range 0–255 as sensor data.
+4. Sensor data is pasted into `sensor.txt` of whichever device is sending.
+5. The output of one device is copied into the `input.txt` of the other to simulate the channel. Bytes can be tampered with during this copy to simulate channel faults.
 
-Communication layer is designed such that counters are used only for sensor-data packets and not replies. Thus replies always have a zero counter. Further each reply has a payload of only one byte thus its second byte is always `00001 000` (in base 10, 8)
+---
 
-### Replies
-One a device gets a sensor-data packet it generates replies. Reply can be an acknowledgement or a re-ask. Replies are not generated for replies (acknowledging acknowledgements accumulates network traffic). If a device sends a reask for a packet with counter 4, the other device resends all packets with counters after 4. 
-
-For this purpose the output buffer of a device is a circular buffer. Old output is overwritten only when it has been acknowledged already. 
-
-## Memory Architecture
-I have one input buffer (32 bytes). `read_input()` reads input of `n` bytes from the `input.txt` and simultaneously processes this data. It continuously looks for packets. Once it finds a packet, it starts storing the packet into the buffer. Then it calls `act_on_input()` which acts on this recieved packet and generates replies. `read_input` then continues finding another valid packet. The function is built such that packets can be split over multiple `r n` prompts and in fact even the payload count byte and starting byte can appear in two different calls.
-
-The output buffer has size 128 bytes. It is modeled as a circular buffer. I have three pointers : 
-- `start_of_unsent_output`
-- `start_of_unacknowledged_output`
-- `end_of_output`
-New sensor data packets are written at `end_of_output` until it hits `start_of_unacknowledged_output`. Unacknowledged output is never overwritten. Once acknowleded, this pointer advances (addition modulo `obs`, object buffer size) to clear space for more writing. When output is written to `output.txt` the `start_of_unsent_output` advances. This never advances past `end_of_output`. When a reask is recieved, the `start_of_unsent_output` drops to `start_of_unacknowledged_output` and advances till the reask, waiting for an `o` prompt to sweep till `end_of_output` thus resending the requisite data
-
-Combined with the reply buffer, these buffers take up `180` bytes. The limit was `256` bytes. Remaining bytes I have left so that the stack can function without any problems.
-
-## Timeout command
-
-If the tester tampers with reply packets or drops them entirely the system stalls. The reciever will never know it missed an acknowledgement since they do not have any counters. And if these packets are tampered with, the reciever generates a reask only for the sensor data packet counter it is expecting, not the reply packet. Thus the output buffer on the reciever device will freeze. 
-
-In such situtation, a real world system would force a clearing of the output buffer by detecting timeout. In this virtual firmware testing application, the tester is expected to give `t` prompt when they want to force a timeout on a device (followed by an `o` to actually resend the data). 
-
-## Demo and Limitations
-I present some simultations next. 
-1. Two executables are created and stored in different folders. Red device and blue device
-2. Each is run so that they populate respective folders with requisite files.
-3. A python script generates random integers from 0 to 255
-4. Random numbers are sent to the sensor file for any device
-5. The device's outputs and inputs are communicated to the other's by simple copy paste operations, with some corrupting in between
+## Demos
 
 ### No corruption
 
@@ -216,3 +326,17 @@ NOTE : Such a tranmission is not ideal. The implementation offers scheduling of 
 
 It might seem like cumulative replies can fix such faults. Problem is, the counter wraps around every 8 packets. Cumulative replies fail in wraparound cases anyways.
 
+---
+
+## Known Limitations
+
+**Reply buffer capacity.**  
+The transmission in last demo (of 8 packets in one call) not ideal. The implementation offers scheduling of only 4 replies at a time. The other replies are dropped completely silently. Thus the sender will never recieve acknowledgements for the remaining four packets. Eventual timeout will cause these packets to be resent. But they will then not match the counters at the reciever. The reciever will send a reask for counter 2. The implemetation treats a reask for counter 2 as an implicit acknowledgement for earlier counters. Thus the sender does free memory and communication can continue.
+
+It might seem like cumulative replies can fix such faults. Problem is, the counter wraps around every 8 packets. Cumulative replies fail in wraparound cases anyways.
+
+**Sustained corruption during recovery.** 
+If the channel continues injecting corrupted packets while the receiver is in `IN_RECOVERY` state, the corrupted packets are silently dropped and no secondary re-ask is generated. The receiver waits indefinitely for the correct counter. A timeout mechanism on the receiver side would resolve this but is not implemented.
+
+**Counter range.** 
+The 3-bit counter allows only 8 distinct values. This is sufficient for normal operation but creates ambiguity if the sender has more than 8 unacknowledged packets in flight simultaneously, which cannot happen within the 128-byte output buffer constraint.
