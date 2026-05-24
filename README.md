@@ -75,7 +75,7 @@ If the tester tampers with reply packets or drops them entirely the system stall
 
 In such situtation, a real world system would force a clearing of the output buffer by detecting timeout. In this virtual firmware testing application, the tester is expected to give `t` prompt when they want to force a timeout on a device (followed by an `o` to actually resend the data). 
 
-## Demo
+## Demo and Limitations
 I present some simultations next. 
 1. Two executables are created and stored in different folders. Red device and blue device
 2. Each is run so that they populate respective folders with requisite files.
@@ -182,3 +182,37 @@ I present some simultations next.
 > 219 8 2 2 25 
 8. Input this into blue. Blue resends one more time 
 > 219 18 206 53 0 16
+
+### Packet Fragmentation
+
+I test this with the valid packet `219 24 24 19 50 0 176`. I fragment this packet in multiple ways, then input it into a device. Console output tells whether the packet is succesfully read. All the following splits worked:
+
+1. Split across two `r n` calls mid payload
+2. Split across three `r n` calls `219` and `24 24 19 50` and `0 176`
+
+### Counter wraparound and garbage bytes.
+I send eight valid packets, beginning with counter 1. Along with garbage bytes separating the packets. The garbage here does not have `219` as a byte since then reask is triggered which has already been tested. Console output verifies that the following eigth packets:
+
+| Counter | Payload | Packet |
+| :--- | :--- | :--- |
+| 1 | 0 | `219 1 0 36` |
+| 2 | 1 | `219 10 161 0 122` |
+| 3 | 3 | `219 27 106 86 12 0 62` |
+| 4 | 2 | `219 20 148 103 0 22` |
+| 5 | 4 | `219 37 193 176 159 150 0 90` |
+| 6 | 0 | `219 6 0 31` |
+| 7 | 2 | `219 23 216 70 0 240` |
+| 0 | 1 | `219 8 235 0 50` |
+| 1 | 4 | `219 33 155 176 175 192 0 74` |
+
+can be recovered from
+
+
+> 195 150 160 100 159 157 `219 1 0 36` 216 173 94 94 128 82 68 193 44 196 47 164 10 9 63 139 200 53 93 5 113 `219 10 161 0 122` 45 48 106 203 242 `219 27 106 86 12 0 62` 21 176 15 `219 20 148 103 0 22` 45 39 239 70 208 163 74 40 231 `219 37 193 176 159 150 0 90` 145 243 153 72 71 43 221 82 184 50 11 71 224 `219 6 0 31` 112 248 101 153 155 59 252 64 31 241 40 6 `219 23 216 70 0 240` 46 204 55 165 116 237 `219 8 235 0 50` 90 153 13 104 184 72 214 59 154 125 132 71 116 114 189 157 108 45 228 211 `219 33 155 176 175 192 0 74` 176 11 194 200 126 
+
+
+
+NOTE : Such a tranmission is not ideal. The implementation offers scheduling of only 4 replies at a time. The other replies are dropped completely silently. Thus the sender will never recieve acknowledgements for the remaining four packets. Eventual timeout will cause these packets to be resent. But they will then not match the counters at the reciever. The reciever will send a reask for counter 2. The implemetation treats a reask for counter 2 as an implicit acknowledgement for earlier counters. Thus the sender does free memory and communication can continue.
+
+It might seem like cumulative replies can fix such faults. Problem is, the counter wraps around every 8 packets. Cumulative replies fail in wraparound cases anyways.
+
