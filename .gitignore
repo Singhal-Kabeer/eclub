@@ -1,5 +1,8 @@
-a.out
-.DS_Store
 input.txt
+main.c
+main.py
 output.txt
+pbcopy
 sensor.txt
+spare.txt
+.DS_Store
